@@ -1112,10 +1112,13 @@ makeTransactionBodyAutoBalance
           ( \w -> babbageEraOnwardsConstraints w $ do
               let totalPotentialCollateral =
                     mconcat
-                      [ txOutValue
+                      [ case value of
+                          TxOutValueShelleyBased _ txOutValue -> txOutValue
+                          TxOutValueStoreBacked{} ->
+                            error "makeTransactionBodyAutoBalance: store-backed collateral is not supported"
                       | TxInsCollateral _ collInputs <- pure $ txInsCollateral txbodycontent
                       , collTxIn <- collInputs
-                      , Just (TxOut _ (TxOutValueShelleyBased _ txOutValue) _ _) <- pure $ Map.lookup collTxIn (unUTxO utxo)
+                      , Just (TxOut _ value _ _) <- pure $ Map.lookup collTxIn (unUTxO utxo)
                       ]
               first TxBodyErrorCollateral $
                 calcReturnAndTotalCollateral
@@ -1420,7 +1423,14 @@ calculatePartialChangeValue sbe incoming txbodycontent = do
   mconcat [incoming, mintedValue, negateValue outgoing]
  where
   newUtxoValue =
-    mconcat [fromLedgerValue sbe v | (TxOut _ (TxOutValueShelleyBased _ v) _ _) <- txOuts txbodycontent]
+    shelleyBasedEraConstraints sbe $
+      mconcat
+        [ case value of
+            TxOutValueShelleyBased _ v -> fromLedgerValue sbe v
+            TxOutValueStoreBacked{} ->
+              error "calculatePartialChangeValue: store-backed outputs are not supported"
+        | TxOut _ value _ _ <- txOuts txbodycontent
+        ]
 
 -- | This is used in the balance calculation in the event where
 -- the user does not supply the UTxO(s) they intend to spend

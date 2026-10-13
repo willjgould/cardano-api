@@ -820,6 +820,10 @@ toShelleyTxOut sbe = shelleyBasedEraConstraints sbe $ \case
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
       )
+  TxOut addr (TxOutValueStoreBacked assets) txoutdata refScript ->
+    L.mkBasicTxOutWithStoreBackedDeposit (toShelleyAddr addr) assets
+      & L.datumTxOutL .~ toBabbageTxOutDatumUTxO txoutdata
+      & L.referenceScriptTxOutL .~ refScriptToShelleyScript sbe refScript
 
 -- | A variant of 'toShelleyTxOutAny that is used only internally to this module
 -- that works with a 'TxOut' in any context (including CtxTx) by ignoring
@@ -860,9 +864,13 @@ toShelleyTxOutAny sbe = shelleyBasedEraConstraints sbe $ \case
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
       )
+  TxOut addr (TxOutValueStoreBacked assets) txoutdata refScript ->
+    L.mkBasicTxOutWithStoreBackedDeposit (toShelleyAddr addr) assets
+      & L.datumTxOutL .~ toBabbageTxOutDatum txoutdata
+      & L.referenceScriptTxOutL .~ refScriptToShelleyScript sbe refScript
 
--- | The legacy API value represents only outputs with an implicit deposit.
--- Reject store-backed outputs rather than discard their deposit representation.
+-- | Store-backed ledger-to-API conversion is not yet supported.
+-- Reject these outputs rather than discard their deposit representation.
 fromLedgerTxOutValue
   :: ShelleyBasedEra era
   -> L.TxOut (ShelleyLedgerEra era)
@@ -965,6 +973,11 @@ data TxOutValue era where
     => ShelleyBasedEra era
     -> L.Value (ShelleyLedgerEra era)
     -> TxOutValue era
+  -- | Application assets whose capacity deposit is held separately in the
+  -- ledger's deposit store. The deposit itself is not part of this value.
+  TxOutValueStoreBacked
+    :: L.ApplicationAssets L.DijkstraEra
+    -> TxOutValue DijkstraEra
 
 deriving instance Eq (TxOutValue era)
 
@@ -976,6 +989,8 @@ instance IsCardanoEra era => ToJSON (TxOutValue era) where
       toJSON ll
     TxOutValueShelleyBased sbe val ->
       shelleyBasedEraConstraints sbe $ toJSON (fromLedgerValue sbe val)
+    TxOutValueStoreBacked{} ->
+      error "toJSON TxOutValue: store-backed output JSON is not supported"
 
 instance IsShelleyBasedEra era => FromJSON (TxOutValue era) where
   parseJSON = withObject "TxOutValue" $ \o ->
@@ -1038,17 +1053,24 @@ lovelaceToTxOutValue era ll =
     TxOutValueShelleyBased era $
       A.mkAdaValue era ll
 
+-- | The coin carried by the output, excluding any separately held capacity deposit.
 txOutValueToLovelace :: TxOutValue era -> L.Coin
 txOutValueToLovelace tv =
   case tv of
     TxOutValueByron l -> l
     TxOutValueShelleyBased sbe v -> v ^. A.adaAssetL sbe
+    TxOutValueStoreBacked (L.ApplicationAssets assets) ->
+      assets ^. A.adaAssetL ShelleyBasedEraDijkstra
 
+-- | The assets carried by the output, excluding any separately held capacity
+-- deposit. This projection does not retain the output's deposit representation.
 txOutValueToValue :: TxOutValue era -> Value
 txOutValueToValue tv =
   case tv of
     TxOutValueByron l -> lovelaceToValue l
     TxOutValueShelleyBased sbe v -> fromLedgerValue sbe v
+    TxOutValueStoreBacked (L.ApplicationAssets assets) ->
+      fromLedgerValue ShelleyBasedEraDijkstra assets
 
 prettyRenderTxOut :: TxOutInAnyEra -> Text
 prettyRenderTxOut (TxOutInAnyEra _ (TxOut (AddressInEra _ addr) txOutVal _ _)) =
