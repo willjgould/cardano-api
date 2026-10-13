@@ -1,3 +1,4 @@
+{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 module Cardano.Api.Ledger.Internal.Reexport
@@ -52,6 +53,8 @@ module Cardano.Api.Ledger.Internal.Reexport
   , EraPParams (..)
   , Era (..)
   , EraTxOut
+  , EraImplicitDepositTxOut
+  , type ImplicitDepositTxOut
   , Inject (..)
   , Network (..)
   , PoolCert (..)
@@ -62,7 +65,7 @@ module Cardano.Api.Ledger.Internal.Reexport
   , SlotNo (..)
   , TxId (..)
   , TxIn (..)
-  , TxOut
+  , TxOut (..)
   , Value
   , MaryValue (..)
   , MultiAsset (..)
@@ -72,7 +75,7 @@ module Cardano.Api.Ledger.Internal.Reexport
   , addDeltaCoin
   , castSafeHash
   , getScriptsNeeded
-  , mkBasicTxOut
+  , mkBasicTxOutWithImplicitDeposit
   , coinTxOutL
   , valueTxOutL
   , toDeltaCoin
@@ -380,20 +383,22 @@ import Cardano.Ledger.Conway.TxCert
   )
 import Cardano.Ledger.Core
   ( Era (..)
+  , EraImplicitDepositTxOut
   , EraPParams (..)
   , EraTxBody (..)
   , EraTxOut
   , PParams (..)
   , PoolCert (..)
   , TopTx
-  , TxOut
+  , TxOut (..)
   , Value
   , fromEraCBOR
-  , mkBasicTxOut
+  , mkBasicTxOutWithImplicitDeposit
   , ppMinFeeAL
   , ppMinUTxOValueL
   , ppTxFeePerByteL
   , toEraCBOR
+  , type ImplicitDepositTxOut
   )
 import Cardano.Ledger.Credential (Credential (..), credToText)
 import Cardano.Ledger.DRep (DRep (..), drepAnchorL, drepDepositL, drepExpiryL)

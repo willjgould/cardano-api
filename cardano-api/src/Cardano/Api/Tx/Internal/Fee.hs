@@ -1688,5 +1688,9 @@ calculateMinimumUTxO
   -> L.Coin
 calculateMinimumUTxO sbe pp txout =
   shelleyBasedEraConstraints sbe $
-    let txOutWithMinCoin = L.setMinCoinTxOut pp (toShelleyTxOutAny sbe txout)
-     in txOutWithMinCoin ^. L.coinTxOutL
+    case toShelleyTxOutAny sbe txout of
+      L.ImplicitDepositTxOut implicitOut ->
+        let txOutWithMinCoin = L.setMinCoinTxOut pp implicitOut
+         in L.coin (txOutWithMinCoin ^. L.valueTxOutL)
+      L.StoreBackedTxOut{} ->
+        error "calculateMinimumUTxO: store-backed outputs are not supported"

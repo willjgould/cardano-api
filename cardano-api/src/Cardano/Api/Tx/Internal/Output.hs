@@ -280,7 +280,7 @@ fromAlonzoTxOut w txdatums txOut =
   alonzoEraOnwardsConstraints w $
     TxOut
       (fromShelleyAddr shelleyBasedEra (txOut ^. L.addrTxOutL))
-      (TxOutValueShelleyBased sbe (txOut ^. L.valueTxOutL))
+      (fromLedgerTxOutValue sbe txOut)
       (fromAlonzoTxOutDatum w txdatums (txOut ^. L.dataHashTxOutL))
       ReferenceScriptNone
  where
@@ -309,7 +309,7 @@ fromBabbageTxOut w txdatums txout =
   babbageEraOnwardsConstraints w $
     TxOut
       (fromShelleyAddr shelleyBasedEra (txout ^. L.addrTxOutL))
-      (TxOutValueShelleyBased sbe (txout ^. L.valueTxOutL))
+      (fromLedgerTxOutValue sbe txout)
       babbageTxOutDatum
       ( case txout ^. L.referenceScriptTxOutL of
           SNothing -> ReferenceScriptNone
@@ -795,26 +795,26 @@ toShelleyTxOut sbe = shelleyBasedEraConstraints sbe $ \case
   TxOut addr (TxOutValueShelleyBased _ value) txoutdata refScript ->
     forEraInEon
       (convert sbe)
-      (L.mkBasicTxOut (toShelleyAddr addr) value)
+      (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value)
       ( \case
           AlonzoEraOnwardsAlonzo ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.dataHashTxOutL
                 .~ toAlonzoTxOutDatumHashUTxO txoutdata
           AlonzoEraOnwardsBabbage ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.datumTxOutL
                 .~ toBabbageTxOutDatum txoutdata
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
           AlonzoEraOnwardsConway ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.datumTxOutL
                 .~ toBabbageTxOutDatumUTxO txoutdata
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
           AlonzoEraOnwardsDijkstra ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.datumTxOutL
                 .~ toBabbageTxOutDatumUTxO txoutdata
               & L.referenceScriptTxOutL
@@ -835,31 +835,43 @@ toShelleyTxOutAny sbe = shelleyBasedEraConstraints sbe $ \case
   TxOut addr (TxOutValueShelleyBased _ value) txoutdata refScript ->
     forEraInEon
       (convert sbe)
-      (L.mkBasicTxOut (toShelleyAddr addr) value)
+      (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value)
       ( \case
           AlonzoEraOnwardsAlonzo ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.dataHashTxOutL
                 .~ toAlonzoTxOutDatumHash txoutdata
           AlonzoEraOnwardsBabbage ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.datumTxOutL
                 .~ toBabbageTxOutDatum txoutdata
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
           AlonzoEraOnwardsConway ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.datumTxOutL
                 .~ toBabbageTxOutDatum txoutdata
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
           AlonzoEraOnwardsDijkstra ->
-            L.mkBasicTxOut (toShelleyAddr addr) value
+            L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr addr) value
               & L.datumTxOutL
                 .~ toBabbageTxOutDatum txoutdata
               & L.referenceScriptTxOutL
                 .~ refScriptToShelleyScript sbe refScript
       )
+
+-- | The legacy API value represents only outputs with an implicit deposit.
+-- Reject store-backed outputs rather than discard their deposit representation.
+fromLedgerTxOutValue
+  :: ShelleyBasedEra era
+  -> L.TxOut (ShelleyLedgerEra era)
+  -> TxOutValue era
+fromLedgerTxOutValue sbe = shelleyBasedEraConstraints sbe $ \case
+  L.ImplicitDepositTxOut txout ->
+    TxOutValueShelleyBased sbe (txout ^. L.valueTxOutL)
+  L.StoreBackedTxOut{} ->
+    error "fromLedgerTxOutValue: store-backed outputs are not supported"
 
 fromShelleyTxOut
   :: forall era ctx
@@ -868,7 +880,7 @@ fromShelleyTxOut
   -> L.TxOut (ShelleyLedgerEra era)
   -> TxOut ctx era
 fromShelleyTxOut sbe ledgerTxOut = shelleyBasedEraConstraints sbe $ do
-  let txOutValue = TxOutValueShelleyBased sbe $ ledgerTxOut ^. L.valueTxOutL
+  let txOutValue = fromLedgerTxOutValue sbe ledgerTxOut
   let addressInEra = fromShelleyAddr sbe $ ledgerTxOut ^. L.addrTxOutL
 
   case sbe of

@@ -261,15 +261,15 @@ mkAdaOnlyTxOut
   -> L.Coin
   -> L.TxOut (ShelleyLedgerEra era)
 mkAdaOnlyTxOut sbe addr coin =
-  mkBasicTxOut sbe addr (mkAdaValue sbe coin)
+  mkBasicTxOutWithImplicitDeposit sbe addr (mkAdaValue sbe coin)
 
-mkBasicTxOut
+mkBasicTxOutWithImplicitDeposit
   :: ShelleyBasedEra era
   -> L.Addr
   -> L.Value (ShelleyLedgerEra era)
   -> L.TxOut (ShelleyLedgerEra era)
-mkBasicTxOut sbe addr value =
-  shelleyBasedEraConstraints sbe $ L.mkBasicTxOut addr value
+mkBasicTxOutWithImplicitDeposit sbe addr value =
+  shelleyBasedEraConstraints sbe $ L.mkBasicTxOutWithImplicitDeposit addr value
 
 mkAdaValue :: ShelleyBasedEra era -> L.Coin -> L.Value (ShelleyLedgerEra era)
 mkAdaValue sbe coin =
@@ -296,7 +296,8 @@ multiAssetL w =
   "Use valueTxOutL from Cardano.Api.Ledger instead."
   #-}
 valueTxOutL
-  :: ShelleyBasedEra era -> Lens' (L.TxOut (ShelleyLedgerEra era)) (L.Value (ShelleyLedgerEra era))
+  :: ShelleyBasedEra era
+  -> Lens' (L.ImplicitDepositTxOut (ShelleyLedgerEra era)) (L.Value (ShelleyLedgerEra era))
 valueTxOutL sbe = shelleyBasedEraConstraints sbe L.valueTxOutL
 
 {-# DEPRECATED
@@ -304,4 +305,4 @@ valueTxOutL sbe = shelleyBasedEraConstraints sbe L.valueTxOutL
   "Use coinTxOutL from Cardano.Api.Ledger instead."
   #-}
 valueTxOutAdaAssetL :: ShelleyBasedEra era -> Lens' (L.TxOut (ShelleyLedgerEra era)) L.Coin
-valueTxOutAdaAssetL sbe = valueTxOutL sbe . adaAssetL sbe
+valueTxOutAdaAssetL sbe = shelleyBasedEraConstraints sbe L.coinTxOutL

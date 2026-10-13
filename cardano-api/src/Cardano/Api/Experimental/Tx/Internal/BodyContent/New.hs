@@ -450,13 +450,18 @@ datumAndRefScriptFields mDatum mRefScript =
     Just Nothing -> ["referenceScript" .= Aeson.Null]
     Just (Just script) -> ["referenceScript" .= ledgerScriptToScriptInAnyLang script]
 
--- | Render just the base fields (address and value) shared by all eras.
+-- | Render the address and value of an implicit-deposit output. Store-backed
+-- output JSON requires a separate representation and is not supported yet.
 txOutBaseJsonFields
   :: L.EraTxOut (ShelleyLedgerEra era) => ShelleyBasedEra era -> L.TxOut (ShelleyLedgerEra era) -> [Pair]
 txOutBaseJsonFields sbe o =
-  [ "address" .= addrToJson (o ^. L.addrTxOutL)
-  , "value" .= fromLedgerValue sbe (o ^. L.valueTxOutL)
-  ]
+  case o of
+    Ledger.ImplicitDepositTxOut implicit ->
+      [ "address" .= addrToJson (o ^. L.addrTxOutL)
+      , "value" .= fromLedgerValue sbe (implicit ^. L.valueTxOutL)
+      ]
+    Ledger.StoreBackedTxOut{} ->
+      error "txOutBaseJsonFields: store-backed output JSON is not supported yet"
 
 -- | Convert a ledger 'L.Addr' to JSON using the same format as the legacy API
 -- (bech32 for Shelley addresses, base58 for Byron addresses).
@@ -549,23 +554,23 @@ txOutParseJson sbe o = do
       let L.MaryValue _ ma = mv
       unless (ma == mempty) $
         fail "txOutParseJson: ada-only era output cannot carry a multi-asset value"
-      pure . TxOut $ L.mkBasicTxOut addr (L.coin mv)
+      pure . TxOut $ L.mkBasicTxOutWithImplicitDeposit addr (L.coin mv)
     ShelleyBasedEraAllegra -> do
       let L.MaryValue _ ma = mv
       unless (ma == mempty) $
         fail "txOutParseJson: ada-only era output cannot carry a multi-asset value"
-      pure . TxOut $ L.mkBasicTxOut addr (L.coin mv)
-    ShelleyBasedEraMary -> pure . TxOut $ L.mkBasicTxOut addr mv
+      pure . TxOut $ L.mkBasicTxOutWithImplicitDeposit addr (L.coin mv)
+    ShelleyBasedEraMary -> pure . TxOut $ L.mkBasicTxOutWithImplicitDeposit addr mv
     ShelleyBasedEraAlonzo -> do
-      let base = L.mkBasicTxOut addr mv
+      let base = L.mkBasicTxOutWithImplicitDeposit addr mv
       mDatumHash <- o .:? "datumhash"
       pure . TxOut $ case mDatumHash of
         Nothing -> base
         Just dh -> base & L.dataHashTxOutL .~ SJust dh
     ShelleyBasedEraBabbage ->
-      babbageOnwardsTxOutParseJson (L.mkBasicTxOut addr mv) o
+      babbageOnwardsTxOutParseJson (L.mkBasicTxOutWithImplicitDeposit addr mv) o
     ShelleyBasedEraConway ->
-      babbageOnwardsTxOutParseJson (L.mkBasicTxOut addr mv) o
+      babbageOnwardsTxOutParseJson (L.mkBasicTxOutWithImplicitDeposit addr mv) o
     ShelleyBasedEraDijkstra -> error "TODO Dijkstra: txOutParseJson: era not supported"
 
 -- | Parse a ledger 'L.Addr' from JSON. Reverse of 'addrToJson'.

@@ -147,6 +147,7 @@ data TxBodyErrorAutoBalance era
     -- not run Plutus scripts and so does not need it.
     TxBodyErrorCollateral CollateralError
   | TxBodyErrorMakeUnsignedTx MakeUnsignedTxError
+  | TxBodyErrorStoreBackedOutputNotSupported
 
 deriving instance Show (TxBodyErrorAutoBalance era)
 
@@ -214,6 +215,8 @@ instance Error (TxBodyErrorAutoBalance era) where
       prettyError collateralError
     TxBodyErrorMakeUnsignedTx err ->
       prettyError err
+    TxBodyErrorStoreBackedOutputNotSupported ->
+      "Balancing store-backed outputs is not supported."
 
 -- | Use when you do not have access to the UTxOs you intend to spend
 estimateBalancedTxBody
@@ -386,7 +389,7 @@ estimateBalancedTxBody'
       changeTxOut :: L.TxOut (LedgerEra era)
       changeTxOut =
         obtainCommonConstraints (useEra @era) $
-          L.mkBasicTxOut (toShelleyAddr changeaddr) changeWithMaxLovelace
+          L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) changeWithMaxLovelace
 
     let (mDummyReturnCollateral, mDummyTotalCollateral) = maybeDummyTotalCollAndCollReturnOutput txbodycontent changeaddr
 
@@ -450,7 +453,7 @@ estimateBalancedTxBody'
         balanceTxOut :: TxOut (LedgerEra era)
         balanceTxOut =
           obtainCommonConstraints (useEra @era) $
-            TxOut (L.mkBasicTxOut (toShelleyAddr changeaddr) balance)
+            TxOut (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) balance)
     obtainCommonConstraints (useEra @era) $ do
       when (coinBalance < 0) $
         Left $
@@ -496,20 +499,22 @@ checkNonNegative
   -> TxOut (LedgerEra era)
   -> Either (TxBodyErrorAutoBalance (LedgerEra era)) IsEmpty
   -- ^ result of check if txout is empty
-checkNonNegative bpparams txout@(TxOut balance) = do
-  let outValue@(L.MaryValue coin multiAsset) = balance ^. obtainCommonConstraints (useEra @era) L.valueTxOutL
-      isPositiveValue = L.pointwise (>) outValue mempty
-  if
-    | L.isZero outValue -> pure Empty -- empty TxOut - ok, it's removed at the end
-    | L.isZero coin ->
-        -- no ADA, just non-ADA assets: positive lovelace is required in such case
-        Left $
-          TxBodyErrorAdaBalanceTooSmall
-            txout
-            (calculateMinimumUTxO bpparams txout)
-            coin
-    | not isPositiveValue -> Left $ TxBodyErrorBalanceNegative coin multiAsset
-    | otherwise -> pure NonEmpty
+checkNonNegative bpparams txout@(TxOut balance) = case balance of
+  L.StoreBackedTxOut{} -> Left TxBodyErrorStoreBackedOutputNotSupported
+  L.ImplicitDepositTxOut output -> do
+    let outValue@(L.MaryValue coin multiAsset) = output ^. obtainCommonConstraints (useEra @era) L.valueTxOutL
+        isPositiveValue = L.pointwise (>) outValue mempty
+    if
+      | L.isZero outValue -> pure Empty -- empty TxOut - ok, it's removed at the end
+      | L.isZero coin ->
+          -- no ADA, just non-ADA assets: positive lovelace is required in such case
+          Left $
+            TxBodyErrorAdaBalanceTooSmall
+              txout
+              (calculateMinimumUTxO bpparams txout)
+              coin
+      | not isPositiveValue -> Left $ TxBodyErrorBalanceNegative coin multiAsset
+      | otherwise -> pure NonEmpty
 
 -- | In the event of spending the exact amount of lovelace and non-ada assets in
 -- the specified input(s), this function excludes the change
@@ -550,9 +555,11 @@ calculateMinimumUTxO
   => Ledger.PParams (LedgerEra era)
   -> TxOut (LedgerEra era)
   -> L.Coin
-calculateMinimumUTxO pp (TxOut txout) =
-  let txOutWithMinCoin = L.setMinCoinTxOut pp txout
-   in txOutWithMinCoin ^. L.coinTxOutL
+calculateMinimumUTxO pp (TxOut txout) = case txout of
+  L.ImplicitDepositTxOut output ->
+    L.coin (L.setMinCoinTxOut pp output ^. L.valueTxOutL)
+  L.StoreBackedTxOut{} ->
+    error "calculateMinimumUTxO: store-backed outputs are not supported"
 
 -- | Result of evaluating a signed transaction against the current ledger state.
 data TxEvaluationResult era = Show (L.Value era) => TxEvaluationResult
@@ -782,7 +789,7 @@ calcReturnAndTotalCollateral fee pp' _ mTxReturnCollateral mTxTotalCollateral cA
       | returnCollateralAmount < 0 ->
           Left $ InsufficientCollateral totalCollateralLovelace totalCollateral
       | otherwise -> obtainCommonConstraints (useEra @era) $ do
-          let returnCollateralTxOut = L.mkBasicTxOut (toShelleyAddr cAddr) returnCollateral
+          let returnCollateralTxOut = L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr cAddr) returnCollateral
               minReturnUTxO = calculateMinimumUTxO pp' (TxOut returnCollateralTxOut)
           if
             | returnCollateralAda >= minReturnUTxO ->
@@ -825,6 +832,7 @@ data FeeCalculationError
   | -- | @MinUTxONotMet actual required@: an output does not meet the minimum UTxO requirement.
     MinUTxONotMet L.Coin L.Coin
   | FeeCalculationDidNotConverge
+  | FeeCalculationStoreBackedOutputNotSupported
   deriving (Show, Eq)
 
 instance Error FeeCalculationError where
@@ -855,6 +863,8 @@ instance Error FeeCalculationError where
       ]
   prettyError FeeCalculationDidNotConverge =
     "Fee calculation did not converge after the maximum number of iterations."
+  prettyError FeeCalculationStoreBackedOutputNotSupported =
+    "Fee calculation for store-backed outputs is not supported."
 
 -- | Recursively calculate the minimum fee for a transaction and balance it.
 --
@@ -973,13 +983,15 @@ checkOutputMinUTxO
   => Ledger.PParams (LedgerEra era)
   -> L.TxOut (LedgerEra era)
   -> Either FeeCalculationError ()
-checkOutputMinUTxO pp out =
-  obtainCommonConstraints (useEra @era) $
-    let txout = TxOut out
-     in case checkMinUTxOValue pp txout of
-          Right () -> Right ()
-          Left (TxOut offending, minRequired) ->
-            Left $ MinUTxONotMet (offending ^. L.coinTxOutL) minRequired
+checkOutputMinUTxO pp out = case out of
+  L.StoreBackedTxOut{} -> Left FeeCalculationStoreBackedOutputNotSupported
+  L.ImplicitDepositTxOut{} ->
+    obtainCommonConstraints (useEra @era) $
+      let txout = TxOut out
+       in case checkMinUTxOValue pp txout of
+            Right () -> Right ()
+            Left (TxOut offending, minRequired) ->
+              Left $ MinUTxONotMet (offending ^. L.coinTxOutL) minRequired
 
 balanceTxOuts
   :: forall era
@@ -995,21 +1007,24 @@ balanceTxOuts changeAddr txBalance (UnsignedTx tx) =
      in case outs of
           rest Seq.:|> lastOut
             | lastOut ^. L.addrTxOutL == changeAddr ->
-                -- Update existing change output in place.
-                -- We compute the new value before writing it into the TxOut,
-                -- because the ledger's TxOut setter throws an exception on
-                -- negative values.
-                let newValue = (lastOut ^. L.valueTxOutL) <> txBalance
-                    changeCoin = L.coin newValue
-                 in if changeCoin < 0
-                      then Left $ NotEnoughAdaForChangeOutput changeCoin
-                      else Right $ rest Seq.:|> (lastOut & L.valueTxOutL .~ newValue)
+                case lastOut of
+                  L.StoreBackedTxOut{} -> Left FeeCalculationStoreBackedOutputNotSupported
+                  L.ImplicitDepositTxOut output ->
+                    -- Update existing change output in place.
+                    -- We compute the new value before writing it into the TxOut,
+                    -- because the ledger's TxOut setter throws an exception on
+                    -- negative values.
+                    let newValue = (output ^. L.valueTxOutL) <> txBalance
+                        changeCoin = L.coin newValue
+                     in if changeCoin < 0
+                          then Left $ NotEnoughAdaForChangeOutput changeCoin
+                          else Right $ rest Seq.:|> L.ImplicitDepositTxOut (output & L.valueTxOutL .~ newValue)
           _ ->
             -- Append a new change output
             let changeCoin = L.coin txBalance
              in if changeCoin < 0
                   then Left $ NotEnoughAdaForNewOutput changeCoin
-                  else Right $ outs Seq.:|> L.mkBasicTxOut changeAddr txBalance
+                  else Right $ outs Seq.:|> L.mkBasicTxOutWithImplicitDeposit changeAddr txBalance
 
 -- Essentially we check for the existence of collateral inputs. If they exist we
 -- create a fictitious collateral return output. Why? Because we need to put dummy values
@@ -1028,7 +1043,9 @@ maybeDummyTotalCollAndCollReturnOutput TxBodyContent{txInsCollateral, txReturnCo
       let dummyRetCol =
             TxReturnCollateral $
               obtainCommonConstraints (useEra @era) $
-                L.mkBasicTxOut (toShelleyAddr cAddr) (L.inject $ L.Coin (2 ^ (64 :: Integer)) - 1)
+                L.mkBasicTxOutWithImplicitDeposit
+                  (toShelleyAddr cAddr)
+                  (L.inject $ L.Coin (2 ^ (64 :: Integer)) - 1)
 
           dummyTotCol = TxTotalCollateral $ L.Coin (2 ^ (32 :: Integer) - 1)
        in case (txReturnCollateral, txTotalCollateral) of
@@ -1055,7 +1072,13 @@ calculatePartialChangeValue incoming txbodycontent = do
  where
   newUtxoValue =
     mconcat
-      [out ^. obtainCommonConstraints (useEra @era) L.valueTxOutL | (TxOut out) <- txOuts txbodycontent]
+      [ case out of
+          L.ImplicitDepositTxOut output ->
+            output ^. obtainCommonConstraints (useEra @era) L.valueTxOutL
+          L.StoreBackedTxOut{} ->
+            error "calculatePartialChangeValue: store-backed outputs are not supported"
+      | TxOut out <- txOuts txbodycontent
+      ]
 
 substituteExecutionUnits
   :: forall era
@@ -1588,7 +1611,7 @@ makeTransactionBodyAutoBalance
           useEra
           txbodycontent
 
-    -- Check the balance before constructing the TxOut. L.mkBasicTxOut calls toCompact, which throws an irrecoverable
+    -- Check the balance before constructing the TxOut. L.mkBasicTxOutWithImplicitDeposit calls toCompact, which throws an irrecoverable
     -- error on negative Coin values, so checkNonNegative would never get to return Left for the negative case.
     initialChangeTxOutValue :: Ledger.Value (LedgerEra era) <- do
       let val = evaluateTransactionBalance pp poolids stakeDelegDeposits drepDelegDeposits utxo txbodyForChange
@@ -1600,7 +1623,7 @@ makeTransactionBodyAutoBalance
 
     let initialChangeTxOut :: TxOut (LedgerEra era) =
           obtainCommonConstraints (useEra @era) $
-            TxOut (L.mkBasicTxOut (toShelleyAddr changeaddr) initialChangeTxOutValue)
+            TxOut (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) initialChangeTxOutValue)
 
     -- Initial change is only used for execution units evaluation, so we don't require minimum UTXO requirement
     -- to be satisfied at this point
@@ -1674,7 +1697,11 @@ makeTransactionBodyAutoBalance
         fee = calculateMinTxFee pp utxo txbody1 nkeys
         totalPotentialCollateral =
           mconcat
-            [ (txOut ^. obtainCommonConstraints (useEra @era) L.valueTxOutL :: L.MaryValue)
+            [ case txOut of
+                L.ImplicitDepositTxOut output ->
+                  (output ^. obtainCommonConstraints (useEra @era) L.valueTxOutL :: L.MaryValue)
+                L.StoreBackedTxOut{} ->
+                  error "makeTransactionBodyAutoBalance: store-backed collateral is not supported"
             | let collInputs = txInsCollateral txbodycontent
             , collTxIn <- collInputs
             , Just txOut <- pure $ Map.lookup (toShelleyTxIn collTxIn) (L.unUTxO utxo)
@@ -1717,7 +1744,7 @@ makeTransactionBodyAutoBalance
         -- minting a multiasset. Therefore we must make the multiasset balance positive
         balanceTxOut :: TxOut (LedgerEra era) =
           obtainCommonConstraints (useEra @era) $
-            TxOut (L.mkBasicTxOut (toShelleyAddr changeaddr) balance)
+            TxOut (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) balance)
       first (uncurry TxBodyErrorMinUTxONotMet)
         . mapM_ (checkMinUTxOValue pp)
         $ txOuts txbodycontent1
