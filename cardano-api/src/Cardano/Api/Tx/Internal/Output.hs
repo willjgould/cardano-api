@@ -869,8 +869,7 @@ toShelleyTxOutAny sbe = shelleyBasedEraConstraints sbe $ \case
       & L.datumTxOutL .~ toBabbageTxOutDatum txoutdata
       & L.referenceScriptTxOutL .~ refScriptToShelleyScript sbe refScript
 
--- | Store-backed ledger-to-API conversion is not yet supported.
--- Reject these outputs rather than discard their deposit representation.
+-- | Preserve the deposit representation when moving from the ledger to the API.
 fromLedgerTxOutValue
   :: ShelleyBasedEra era
   -> L.TxOut (ShelleyLedgerEra era)
@@ -878,8 +877,10 @@ fromLedgerTxOutValue
 fromLedgerTxOutValue sbe = shelleyBasedEraConstraints sbe $ \case
   L.ImplicitDepositTxOut txout ->
     TxOutValueShelleyBased sbe (txout ^. L.valueTxOutL)
-  L.StoreBackedTxOut{} ->
-    error "fromLedgerTxOutValue: store-backed outputs are not supported"
+  -- Strict store-backed payloads are uninhabited before Dijkstra.
+  L.StoreBackedTxOut txout -> case sbe of
+    ShelleyBasedEraDijkstra ->
+      TxOutValueStoreBacked (txout ^. L.applicationAssetsTxOutL)
 
 fromShelleyTxOut
   :: forall era ctx
