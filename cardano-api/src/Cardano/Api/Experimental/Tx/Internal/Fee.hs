@@ -148,6 +148,7 @@ data TxBodyErrorAutoBalance era
     TxBodyErrorCollateral CollateralError
   | TxBodyErrorMakeUnsignedTx MakeUnsignedTxError
   | TxBodyErrorStoreBackedOutputNotSupported
+  | TxBodyErrorNestedOrDepositStoreNotSupported
 
 deriving instance Show (TxBodyErrorAutoBalance era)
 
@@ -217,6 +218,15 @@ instance Error (TxBodyErrorAutoBalance era) where
       prettyError err
     TxBodyErrorStoreBackedOutputNotSupported ->
       "Balancing store-backed outputs is not supported."
+    TxBodyErrorNestedOrDepositStoreNotSupported ->
+      "Balancing sub-transactions or deposit-store operations is not supported."
+
+-- | These fields can be constructed, but their accounting and witness
+-- estimation are not supported by the balancing paths yet.
+checkSupportedBalanceFields :: TxBodyContent era -> Either (TxBodyErrorAutoBalance era) ()
+checkSupportedBalanceFields content =
+  when (not (null (txSubTransactions content)) || isJust (txDepositStoreChange content)) $
+    Left TxBodyErrorNestedOrDepositStoreNotSupported
 
 -- | Use when you do not have access to the UTxOs you intend to spend
 estimateBalancedTxBody
@@ -329,6 +339,7 @@ estimateBalancedTxBody'
   sizeOfAllReferenceScripts
   changeaddr
   totalUTxOValue = do
+    first TxFeeEstimationBalanceError $ checkSupportedBalanceFields txbodycontent
     -- The ledger requires collateral only for transactions that run Plutus
     -- scripts, so collateral inputs on a transaction without them are an
     -- error: the ledger would ignore them, but they would cost fees and
@@ -1089,28 +1100,13 @@ substituteExecutionUnits
 substituteExecutionUnits
   exUnitsMap
   txbodycontent@( TxBodyContent
-                    txIns
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    _
-                    txWithdrawals
-                    txCertificates
-                    txMintValue
-                    _
-                    txProposalProcedures
-                    txVotingProcedures
-                    _
-                    _
-                    _
+                    { txIns
+                    , txWithdrawals
+                    , txCertificates
+                    , txMintValue
+                    , txProposalProcedures
+                    , txVotingProcedures
+                    }
                   ) = do
     mappedTxIns <- mapScriptWitnessesTxIns txIns
     mappedWithdrawals <- mapScriptWitnessesWithdrawals txWithdrawals
@@ -1591,6 +1587,7 @@ makeTransactionBodyAutoBalance
   txbodycontent
   changeaddr
   mnkeys = do
+    checkSupportedBalanceFields txbodycontent
     -- The ledger requires collateral only for transactions that run Plutus
     -- scripts, so collateral inputs on a transaction without them are an
     -- error: the ledger would ignore them, but they would cost fees and

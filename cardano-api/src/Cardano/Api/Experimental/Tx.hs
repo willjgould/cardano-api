@@ -151,12 +151,19 @@ module Cardano.Api.Experimental.Tx
   , setTxProposalProcedures
   , setTxProtocolParams
   , setTxScriptValidity
+  , setTxSubTransactions
   , setTxSupplementalDatums
   , setTxTreasuryDonation
   , setTxValidityLowerBound
   , setTxValidityUpperBound
   , setTxVotingProcedures
   , setTxWithdrawals
+
+    -- * Sub-transactions (Dijkstra era onwards)
+  , SubTxBodyContent (..)
+  , defaultSubTxBodyContent
+  , UnsignedSubTx (..)
+  , makeUnsignedSubTx
 
     -- * TxBodyContent sub type
   , TxCertificates (..)

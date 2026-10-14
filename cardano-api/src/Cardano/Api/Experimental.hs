@@ -27,6 +27,13 @@ module Cardano.Api.Experimental
   , getAnchorDataFromCertificate
   , mkTxCertificates
 
+    -- ** Sub-transactions (Dijkstra era onwards)
+  , SubTxBodyContent (..)
+  , defaultSubTxBodyContent
+  , UnsignedSubTx (..)
+  , makeUnsignedSubTx
+  , setTxSubTransactions
+
     -- ** Transaction evaluation
   , evaluateTransaction
   , evaluateSignedTx

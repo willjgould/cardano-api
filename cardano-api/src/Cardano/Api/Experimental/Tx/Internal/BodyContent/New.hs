@@ -31,6 +31,11 @@ module Cardano.Api.Experimental.Tx.Internal.BodyContent.New
   , getDatums
   , collectTxBodyScriptWitnessRequirements
   , makeUnsignedTx
+  , SubTxBodyContent (..)
+  , defaultSubTxBodyContent
+  , UnsignedSubTx (..)
+  , makeUnsignedSubTx
+  , setTxSubTransactions
   , extractAllIndexedPlutusScriptWitnesses
   , txMintValueToValue
   , mkTxCertificates
@@ -74,6 +79,7 @@ module Cardano.Api.Experimental.Tx.Internal.BodyContent.New
 where
 
 import Cardano.Api.Address
+import Cardano.Api.Era.Internal.Core (DijkstraEra)
 import Cardano.Api.Era.Internal.Eon.ShelleyBasedEra (ShelleyBasedEra (..), ShelleyLedgerEra)
 import Cardano.Api.Error
 import Cardano.Api.Experimental.AnyScriptWitness
@@ -114,6 +120,7 @@ import Cardano.Api.Plutus.Internal.Script
   )
 import Cardano.Api.Plutus.Internal.Script qualified as OldScript
 import Cardano.Api.Plutus.Internal.ScriptData qualified as Api
+import Cardano.Api.Pretty (pshow)
 import Cardano.Api.Serialise.Cbor (serialiseToCBOR)
 import Cardano.Api.Tx.Internal.Body
   ( CtxTx
@@ -141,6 +148,7 @@ import Cardano.Ledger.Alonzo.TxBody qualified as L
 import Cardano.Ledger.Alonzo.TxWits qualified as L
 import Cardano.Ledger.Api qualified as L
 import Cardano.Ledger.Core qualified as Ledger
+import Cardano.Ledger.Dijkstra.Core qualified as Dijkstra
 import Cardano.Ledger.Plutus.Language (PlutusBinary (..), plutusLanguage)
 import Cardano.Ledger.Plutus.Language qualified as Plutus
 
@@ -157,6 +165,7 @@ import Data.Map.Ordered.Strict qualified as OMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe
+import Data.OMap.Strict qualified as LOMap
 import Data.OSet.Strict (OSet)
 import Data.OSet.Strict qualified as OSet
 import Data.Sequence.Strict qualified as Seq
@@ -172,6 +181,10 @@ data MakeUnsignedTxError
     -- parameters were provided. Protocol parameters are required to
     -- compute the script integrity hash (script_data_hash).
     MakeUnsignedTxMissingProtocolParams
+  | -- | Nested transactions and deposit-store operations require Dijkstra.
+    MakeUnsignedTxDijkstraFieldsNotSupported
+  | -- | Sub-transaction construction currently supports key inputs only.
+    MakeUnsignedSubTxScriptWitnessNotSupported TxIn
   deriving (Eq, Show)
 
 instance Error MakeUnsignedTxError where
@@ -181,6 +194,10 @@ instance Error MakeUnsignedTxError where
       , "Protocol parameters are required to compute the script integrity hash "
       , "(script_data_hash) from the cost models."
       ]
+  prettyError MakeUnsignedTxDijkstraFieldsNotSupported =
+    "Sub-transactions and deposit-store operations require the Dijkstra era."
+  prettyError (MakeUnsignedSubTxScriptWitnessNotSupported txIn) =
+    "Sub-transaction script inputs are not supported: " <> pshow txIn
 
 makeUnsignedTx
   :: forall era
@@ -188,6 +205,11 @@ makeUnsignedTx
   -> TxBodyContent (LedgerEra era)
   -> Either MakeUnsignedTxError (UnsignedTx (LedgerEra era))
 makeUnsignedTx era bc = obtainCommonConstraints era $ do
+  () <- case era of
+    ConwayEra ->
+      when (not (null (txSubTransactions bc)) || isJust (txDepositStoreChange bc)) $
+        Left MakeUnsignedTxDijkstraFieldsNotSupported
+    DijkstraEra -> pure ()
   let TxScriptWitnessRequirements languages scripts datums redeemers = collectTxBodyScriptWitnessRequirements bc
 
   -- cardano-api types
@@ -255,12 +277,64 @@ makeUnsignedTx era bc = obtainCommonConstraints era $ do
           & L.rdmrsTxWitsL .~ redeemers
 
   let eraSpecificTxBody = eraSpecificLedgerTxBody era ledgerTxBody bc
+      completeTxBody = case era of
+        ConwayEra -> eraSpecificTxBody
+        DijkstraEra ->
+          eraSpecificTxBody
+            & Dijkstra.subTransactionsTxBodyL .~ txSubTransactions bc
+            & Dijkstra.depositStoreChangeTxBodyL .~ L.maybeToStrictMaybe (txDepositStoreChange bc)
   Right $
     UnsignedTx $
-      L.mkBasicTx eraSpecificTxBody
+      L.mkBasicTx completeTxBody
         & L.witsTxL .~ scriptWitnesses
         & L.auxDataTxL .~ L.maybeToStrictMaybe (toAuxiliaryData (txMetadata bc) (txAuxScripts bc))
         & L.isPhase2ValidTxL .~ scriptValidity
+
+-- | Contents of a Dijkstra sub-transaction with key inputs. Fees and nested
+-- children belong to the parent and cannot be specified here. Script inputs
+-- are rejected until their witness construction is supported.
+data SubTxBodyContent = SubTxBodyContent
+  { subTxIns :: [(TxIn, AnyWitness (LedgerEra DijkstraEra))]
+  , subTxOuts :: [TxOut (LedgerEra DijkstraEra)]
+  , subTxDepositStoreChange :: Maybe Dijkstra.DepositStoreSubTxChange
+  }
+
+defaultSubTxBodyContent :: SubTxBodyContent
+defaultSubTxBodyContent =
+  SubTxBodyContent
+    { subTxIns = []
+    , subTxOuts = []
+    , subTxDepositStoreChange = Nothing
+    }
+
+-- | A Dijkstra sub-transaction without key witnesses.
+newtype UnsignedSubTx = UnsignedSubTx (Ledger.Tx Ledger.SubTx (LedgerEra DijkstraEra))
+  deriving (Eq, Show)
+
+-- | Construct a sub-transaction without balancing or ledger validation.
+makeUnsignedSubTx :: SubTxBodyContent -> Either MakeUnsignedTxError UnsignedSubTx
+makeUnsignedSubTx SubTxBodyContent{subTxIns, subTxOuts, subTxDepositStoreChange} = do
+  forM_ subTxIns $ \(txIn, witness) -> case witness of
+    AnyKeyWitnessPlaceholder -> pure ()
+    AnySimpleScriptWitness{} -> Left (MakeUnsignedSubTxScriptWitnessNotSupported txIn)
+    AnyPlutusScriptWitness{} -> Left (MakeUnsignedSubTxScriptWitnessNotSupported txIn)
+  let body :: Ledger.TxBody Ledger.SubTx (LedgerEra DijkstraEra)
+      body =
+        L.mkBasicTxBody
+          & L.inputsTxBodyL .~ convTxIns subTxIns
+          & L.outputsTxBodyL .~ fromList [out | TxOut out <- subTxOuts]
+          & Dijkstra.depositStoreSubTxChangeTxBodyL .~ L.maybeToStrictMaybe subTxDepositStoreChange
+  pure $ UnsignedSubTx $ L.mkBasicTx body
+
+-- | Replace the children, keyed by their transaction IDs in insertion order.
+-- Repeated IDs have the ledger ordered map's deduplication semantics.
+setTxSubTransactions
+  :: Ledger.EraTx era
+  => [Ledger.Tx Ledger.SubTx era]
+  -> TxBodyContent era
+  -> TxBodyContent era
+setTxSubTransactions children content =
+  content{txSubTransactions = LOMap.fromFoldable children}
 
 convTxIns :: [(TxIn, AnyWitness era)] -> Set L.TxIn
 convTxIns inputs =
@@ -801,6 +875,10 @@ data TxBodyContent era
   , txSupplementalDatums :: Map L.DataHash (L.Data era)
   -- ^ Supplemental datums are datums whose hashes correspond to output datum hashes.
   -- They are included in the transaction witness set for communication purposes only.
+  , txSubTransactions :: LOMap.OMap L.TxId (Ledger.Tx Ledger.SubTx era)
+  -- ^ Dijkstra children. Earlier eras reject a nonempty map.
+  , txDepositStoreChange :: Maybe Dijkstra.DepositStoreChange
+  -- ^ Explicit Dijkstra deposit-store operation; earlier eras reject it.
   }
 
 defaultTxBodyContent
@@ -829,6 +907,8 @@ defaultTxBodyContent =
     , txCurrentTreasuryValue = Nothing
     , txTreasuryDonation = Nothing
     , txSupplementalDatums = mempty
+    , txSubTransactions = LOMap.empty
+    , txDepositStoreChange = Nothing
     }
 
 extractAllIndexedPlutusScriptWitnesses
