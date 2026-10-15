@@ -76,6 +76,7 @@ import Cardano.Ledger.Api qualified as L
 import Cardano.Ledger.Coin qualified as L
 import Cardano.Ledger.Conway.Governance qualified as L
 import Cardano.Ledger.Credential as Ledger (Credential)
+import Cardano.Ledger.Dijkstra.UTxODeposit.TopTx qualified as TopTx
 import Cardano.Ledger.Val qualified as L
 
 import Control.Monad
@@ -225,8 +226,11 @@ instance Error (TxBodyErrorAutoBalance era) where
 -- estimation are not supported by the balancing paths yet.
 checkSupportedBalanceFields :: TxBodyContent era -> Either (TxBodyErrorAutoBalance era) ()
 checkSupportedBalanceFields content =
-  when (not (null (txSubTransactions content)) || isJust (txDepositStoreChange content)) $
-    Left TxBodyErrorNestedOrDepositStoreNotSupported
+  when
+    ( not (null (txSubTransactions content))
+        || TopTx.hasUTxODepositDeclaration (txNetUTxODepositChange content)
+    )
+    $ Left TxBodyErrorNestedOrDepositStoreNotSupported
 
 -- | Use when you do not have access to the UTxOs you intend to spend
 estimateBalancedTxBody

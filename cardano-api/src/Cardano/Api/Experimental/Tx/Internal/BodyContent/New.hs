@@ -149,6 +149,8 @@ import Cardano.Ledger.Alonzo.TxWits qualified as L
 import Cardano.Ledger.Api qualified as L
 import Cardano.Ledger.Core qualified as Ledger
 import Cardano.Ledger.Dijkstra.Core qualified as Dijkstra
+import Cardano.Ledger.Dijkstra.UTxODeposit.SubTx qualified as SubTx
+import Cardano.Ledger.Dijkstra.UTxODeposit.TopTx qualified as TopTx
 import Cardano.Ledger.Plutus.Language (PlutusBinary (..), plutusLanguage)
 import Cardano.Ledger.Plutus.Language qualified as Plutus
 
@@ -207,8 +209,9 @@ makeUnsignedTx
 makeUnsignedTx era bc = obtainCommonConstraints era $ do
   () <- case era of
     ConwayEra ->
-      when (not (null (txSubTransactions bc)) || isJust (txDepositStoreChange bc)) $
-        Left MakeUnsignedTxDijkstraFieldsNotSupported
+      when
+        (not (null (txSubTransactions bc)) || TopTx.hasUTxODepositDeclaration (txNetUTxODepositChange bc))
+        $ Left MakeUnsignedTxDijkstraFieldsNotSupported
     DijkstraEra -> pure ()
   let TxScriptWitnessRequirements languages scripts datums redeemers = collectTxBodyScriptWitnessRequirements bc
 
@@ -282,7 +285,7 @@ makeUnsignedTx era bc = obtainCommonConstraints era $ do
         DijkstraEra ->
           eraSpecificTxBody
             & Dijkstra.subTransactionsTxBodyL .~ txSubTransactions bc
-            & Dijkstra.depositStoreChangeTxBodyL .~ L.maybeToStrictMaybe (txDepositStoreChange bc)
+            & Dijkstra.netUTxODepositChangeTxBodyL .~ txNetUTxODepositChange bc
   Right $
     UnsignedTx $
       L.mkBasicTx completeTxBody
@@ -296,7 +299,8 @@ makeUnsignedTx era bc = obtainCommonConstraints era $ do
 data SubTxBodyContent = SubTxBodyContent
   { subTxIns :: [(TxIn, AnyWitness (LedgerEra DijkstraEra))]
   , subTxOuts :: [TxOut (LedgerEra DijkstraEra)]
-  , subTxDepositStoreChange :: Maybe Dijkstra.DepositStoreSubTxChange
+  , subTxNetUTxODepositChange :: SubTx.SubTxUTxODepositDeclaration
+  -- ^ Explicit declaration of the child's net UTxO deposit change.
   }
 
 defaultSubTxBodyContent :: SubTxBodyContent
@@ -304,7 +308,7 @@ defaultSubTxBodyContent =
   SubTxBodyContent
     { subTxIns = []
     , subTxOuts = []
-    , subTxDepositStoreChange = Nothing
+    , subTxNetUTxODepositChange = SubTx.NoUTxODepositDeclaration
     }
 
 -- | A Dijkstra sub-transaction without key witnesses.
@@ -313,7 +317,7 @@ newtype UnsignedSubTx = UnsignedSubTx (Ledger.Tx Ledger.SubTx (LedgerEra Dijkstr
 
 -- | Construct a sub-transaction without balancing or ledger validation.
 makeUnsignedSubTx :: SubTxBodyContent -> Either MakeUnsignedTxError UnsignedSubTx
-makeUnsignedSubTx SubTxBodyContent{subTxIns, subTxOuts, subTxDepositStoreChange} = do
+makeUnsignedSubTx SubTxBodyContent{subTxIns, subTxOuts, subTxNetUTxODepositChange} = do
   forM_ subTxIns $ \(txIn, witness) -> case witness of
     AnyKeyWitnessPlaceholder -> pure ()
     AnySimpleScriptWitness{} -> Left (MakeUnsignedSubTxScriptWitnessNotSupported txIn)
@@ -323,7 +327,7 @@ makeUnsignedSubTx SubTxBodyContent{subTxIns, subTxOuts, subTxDepositStoreChange}
         L.mkBasicTxBody
           & L.inputsTxBodyL .~ convTxIns subTxIns
           & L.outputsTxBodyL .~ fromList [out | TxOut out <- subTxOuts]
-          & Dijkstra.depositStoreSubTxChangeTxBodyL .~ L.maybeToStrictMaybe subTxDepositStoreChange
+          & Dijkstra.subTxNetUTxODepositChangeTxBodyL .~ subTxNetUTxODepositChange
   pure $ UnsignedSubTx $ L.mkBasicTx body
 
 -- | Replace the children, keyed by their transaction IDs in insertion order.
@@ -877,8 +881,8 @@ data TxBodyContent era
   -- They are included in the transaction witness set for communication purposes only.
   , txSubTransactions :: LOMap.OMap L.TxId (Ledger.Tx Ledger.SubTx era)
   -- ^ Dijkstra children. Earlier eras reject a nonempty map.
-  , txDepositStoreChange :: Maybe Dijkstra.DepositStoreChange
-  -- ^ Explicit Dijkstra deposit-store operation; earlier eras reject it.
+  , txNetUTxODepositChange :: TopTx.TopTxUTxODepositDeclaration
+  -- ^ Explicit declaration of the net UTxO deposit change; earlier eras reject it.
   }
 
 defaultTxBodyContent
@@ -908,7 +912,7 @@ defaultTxBodyContent =
     , txTreasuryDonation = Nothing
     , txSupplementalDatums = mempty
     , txSubTransactions = LOMap.empty
-    , txDepositStoreChange = Nothing
+    , txNetUTxODepositChange = TopTx.NoUTxODepositDeclaration
     }
 
 extractAllIndexedPlutusScriptWitnesses
