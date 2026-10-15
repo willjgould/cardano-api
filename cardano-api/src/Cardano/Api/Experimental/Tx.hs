@@ -164,6 +164,10 @@ module Cardano.Api.Experimental.Tx
   , defaultSubTxBodyContent
   , UnsignedSubTx (..)
   , makeUnsignedSubTx
+  , SignedSubTx (..)
+  , makeSubTxKeyWitness
+  , signSubTx
+  , setTxSignedSubTransactions
 
     -- * TxBodyContent sub type
   , TxCertificates (..)
@@ -341,6 +345,44 @@ signTx era bootstrapWits shelleyKeyWits (UnsignedTx unsigned) =
                 .~ Set.fromList bootstrapWits
         signedTx = unsigned & L.witsTxL .~ (keyWits <> currentScriptWitnesses)
      in SignedTx signedTx
+
+-- | A Dijkstra sub-transaction with key witnesses attached.
+newtype SignedSubTx = SignedSubTx (Ledger.Tx Ledger.SubTx (LedgerEra Api.DijkstraEra))
+  deriving (Eq, Show)
+
+-- | Sign the child's own body. A parent signature does not witness its children.
+makeSubTxKeyWitness
+  :: HasCallStack
+  => UnsignedSubTx
+  -> ShelleyWitnessSigningKey
+  -> L.WitVKey L.Witness
+makeSubTxKeyWitness (UnsignedSubTx unsigned) wsk =
+  let txhash = L.extractHash $ L.hashAnnotated (unsigned ^. L.bodyTxL)
+      sk = toShelleySigningKey wsk
+      vk = getShelleyKeyWitnessVerificationKey sk
+   in L.WitVKey vk (makeShelleySignature txhash sk)
+
+-- | Attach key witnesses, preserving any witnesses already present.
+signSubTx
+  :: [L.BootstrapWitness]
+  -> [L.WitVKey L.Witness]
+  -> UnsignedSubTx
+  -> SignedSubTx
+signSubTx bootstrapWits shelleyKeyWits (UnsignedSubTx unsigned) =
+  let keyWits =
+        L.mkBasicTxWits
+          & L.addrTxWitsL .~ Set.fromList shelleyKeyWits
+          & L.bootAddrTxWitsL .~ Set.fromList bootstrapWits
+   in SignedSubTx $ unsigned & L.witsTxL %~ (keyWits <>)
+
+-- | Replace the children with their signed forms, using 'setTxSubTransactions'.
+-- Do this before signing the parent: its body includes the child witnesses.
+setTxSignedSubTransactions
+  :: [SignedSubTx]
+  -> TxBodyContent (LedgerEra Api.DijkstraEra)
+  -> TxBodyContent (LedgerEra Api.DijkstraEra)
+setTxSignedSubTransactions children =
+  setTxSubTransactions [child | SignedSubTx child <- children]
 
 -- | Like 'evaluateTransaction' but accepts a 'SignedTx' directly.
 evaluateSignedTx

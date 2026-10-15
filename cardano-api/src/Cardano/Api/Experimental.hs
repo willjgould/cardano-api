@@ -33,6 +33,10 @@ module Cardano.Api.Experimental
   , UnsignedSubTx (..)
   , makeUnsignedSubTx
   , setTxSubTransactions
+  , SignedSubTx (..)
+  , makeSubTxKeyWitness
+  , signSubTx
+  , setTxSignedSubTransactions
 
     -- ** Transaction evaluation
   , evaluateTransaction
