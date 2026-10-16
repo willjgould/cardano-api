@@ -79,6 +79,7 @@ import Cardano.Ledger.Conway.Governance qualified as L
 import Cardano.Ledger.Credential as Ledger (Credential, credKeyHashWitness)
 import Cardano.Ledger.Dijkstra.UTxODeposit.TopTx qualified as TopTx
 import Cardano.Ledger.Keys (asWitness)
+import Cardano.Ledger.State qualified as L (getScriptsHashesNeeded)
 import Cardano.Ledger.Val qualified as L
 
 import Control.Monad
@@ -152,6 +153,7 @@ data TxBodyErrorAutoBalance era
   | TxBodyErrorMakeUnsignedTx MakeUnsignedTxError
   | TxBodyErrorStoreBackedOutputNotSupported
   | TxBodyErrorNestedOrDepositStoreNotSupported
+  | TxBodyErrorNestedScriptsNotSupported
 
 deriving instance Show (TxBodyErrorAutoBalance era)
 
@@ -223,9 +225,10 @@ instance Error (TxBodyErrorAutoBalance era) where
       "Balancing store-backed outputs is not supported."
     TxBodyErrorNestedOrDepositStoreNotSupported ->
       "Balancing sub-transactions or deposit-store operations is not supported."
+    TxBodyErrorNestedScriptsNotSupported ->
+      "Balancing nested transactions with scripts is not supported."
 
--- | These fields can be constructed, but their accounting and witness
--- estimation are not supported by the balancing paths yet.
+-- | Estimation without the real UTxO cannot account for child inputs.
 checkSupportedBalanceFields :: TxBodyContent era -> Either (TxBodyErrorAutoBalance era) ()
 checkSupportedBalanceFields content =
   when
@@ -233,6 +236,32 @@ checkSupportedBalanceFields content =
         || TopTx.hasUTxODepositDeclaration (txNetUTxODepositChange content)
     )
     $ Left TxBodyErrorNestedOrDepositStoreNotSupported
+
+-- | With real inputs the ledger accounts for signed children and the explicit
+-- net deposit. Child scripts still need a separate execution-unit path: changing
+-- their budgets here would invalidate their signatures.
+checkSupportedAutoBalanceFields
+  :: forall era
+   . IsEra era
+  => L.UTxO (LedgerEra era)
+  -> TxBodyContent (LedgerEra era)
+  -> Either (TxBodyErrorAutoBalance (LedgerEra era)) ()
+checkSupportedAutoBalanceFields utxo content = obtainCommonConstraints (useEra @era) $ do
+  forM_ (txOuts content) $ \(TxOut output) -> case output of
+    L.StoreBackedTxOut{} -> Left TxBodyErrorStoreBackedOutputNotSupported
+    L.ImplicitDepositTxOut{} -> Right ()
+  let children = txSubTransactions content
+  when (not (null children) && hasPlutusScriptWitnesses content) $
+    Left TxBodyErrorNestedScriptsNotSupported
+  forM_ children $ \child -> do
+    let scriptsNeeded = L.getScriptsHashesNeeded (L.getScriptsNeeded utxo (child ^. L.bodyTxL))
+        witnesses = child ^. L.witsTxL
+    when
+      ( not (Set.null scriptsNeeded)
+          || not (Map.null (witnesses ^. L.scriptTxWitsL))
+          || not (Map.null (L.unRedeemers (witnesses ^. L.rdmrsTxWitsL)))
+      )
+      $ Left TxBodyErrorNestedScriptsNotSupported
 
 -- | Use when you do not have access to the UTxOs you intend to spend
 estimateBalancedTxBody
@@ -1552,6 +1581,12 @@ evaluateTransactionExecutionUnits systemstart epochInfo pp utxo tx =
 --
 -- To do this, it requires more information than 'makeTransactionBody', all of
 -- which can be queried from a local node.
+--
+-- Signed key-only children are preserved. Supply their inputs in the UTxO and
+-- declare the net UTxO deposit explicitly; the ledger includes both in the
+-- balance, and the signed child bytes contribute to the fee. The parent change
+-- uses an implicit deposit. Automatic deposit pricing and nested script
+-- execution are not supported here.
 makeTransactionBodyAutoBalance
   :: forall era
    . ()
@@ -1570,7 +1605,7 @@ makeTransactionBodyAutoBalance
   -- ^ The map of all deposits for DRep credentials that are being
   --   unregistered in this transaction
   -> L.UTxO (LedgerEra era)
-  -- ^ The transaction inputs (including reference and collateral ones), not the entire 'UTxO'.
+  -- ^ The transaction inputs (including child, reference and collateral inputs), not the entire 'UTxO'.
   -> TxBodyContent (LedgerEra era)
   -> AddressInEra era
   -- ^ Change address
@@ -1590,7 +1625,7 @@ makeTransactionBodyAutoBalance
   txbodycontent
   changeaddr
   mnkeys = do
-    checkSupportedBalanceFields txbodycontent
+    checkSupportedAutoBalanceFields utxo txbodycontent
     -- The ledger requires collateral only for transactions that run Plutus
     -- scripts, so collateral inputs on a transaction without them are an
     -- error: the ledger would ignore them, but they would cost fees and
