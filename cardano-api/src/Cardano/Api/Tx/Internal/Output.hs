@@ -90,6 +90,7 @@ import Cardano.Ledger.Plutus.Data qualified as Plutus
 import Data.Aeson (object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Aeson
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Text qualified as Aeson
 import Data.Aeson.Types qualified as Aeson
 import Data.Bifunctor (Bifunctor (..))
@@ -378,7 +379,10 @@ txOutToJsonValue era (TxOut addr val dat refScript) =
     DijkstraEra ->
       object
         [ "address" .= addr
-        , "value" .= val
+        , case val of
+            TxOutValueStoreBacked (L.ApplicationAssets assets) ->
+              "applicationAssets" .= fromLedgerValue ShelleyBasedEraDijkstra assets
+            _ -> "value" .= val
         , datHashJsonVal dat
         , "datum" .= datJsonVal dat
         , "inlineDatum" .= inlineDatumJsonVal dat
@@ -463,25 +467,39 @@ parseInlineDatum o = do
       fail
         "Should not be possible to create a tx output with either an inline datum hash or an inline datum"
 
+-- | The output kind is determined by exactly one value field. Ordinary outputs
+-- retain their existing JSON representation.
+parseTxOutValue :: ShelleyBasedEra era -> Aeson.Object -> Aeson.Parser (TxOutValue era)
+parseTxOutValue sbe fields = shelleyBasedEraConstraints sbe $
+  case (KeyMap.lookup "value" fields, KeyMap.lookup "applicationAssets" fields) of
+    (Just value, Nothing) -> do
+      parsed <- Aeson.parseJSON value
+      case parsed of
+        TxOutValueStoreBacked{} -> fail "TxOut: applicationAssets must be an output field"
+        _ -> pure parsed
+    (Nothing, Just assets) ->
+      Aeson.parseJSON $ object ["applicationAssets" .= assets]
+    _ -> fail "TxOut: expected exactly one of value or applicationAssets"
+
 instance IsShelleyBasedEra era => FromJSON (TxOut CtxTx era) where
   parseJSON = withObject "TxOut" $ \o -> do
     case shelleyBasedEra :: ShelleyBasedEra era of
       ShelleyBasedEraShelley ->
         TxOut
           <$> o .: "address"
-          <*> o .: "value"
+          <*> parseTxOutValue shelleyBasedEra o
           <*> return TxOutDatumNone
           <*> return ReferenceScriptNone
       ShelleyBasedEraMary ->
         TxOut
           <$> o .: "address"
-          <*> o .: "value"
+          <*> parseTxOutValue shelleyBasedEra o
           <*> return TxOutDatumNone
           <*> return ReferenceScriptNone
       ShelleyBasedEraAllegra ->
         TxOut
           <$> o .: "address"
-          <*> o .: "value"
+          <*> parseTxOutValue shelleyBasedEra o
           <*> return TxOutDatumNone
           <*> return ReferenceScriptNone
       ShelleyBasedEraAlonzo -> alonzoTxOutParser AlonzoEraOnwardsAlonzo o
@@ -576,7 +594,7 @@ instance IsShelleyBasedEra era => FromJSON (TxOut CtxTx era) where
 
       -- Parse required fields common to all TxOuts
       parsedAddress <- o .: "address"
-      parsedValue <- o .: "value"
+      parsedValue <- parseTxOutValue (convert w) o
 
       -- Parse datum based on which fields are present
       txOutDatum <-
@@ -606,19 +624,19 @@ instance IsShelleyBasedEra era => FromJSON (TxOut CtxUTxO era) where
       ShelleyBasedEraShelley ->
         TxOut
           <$> o .: "address"
-          <*> o .: "value"
+          <*> parseTxOutValue shelleyBasedEra o
           <*> return TxOutDatumNone
           <*> return ReferenceScriptNone
       ShelleyBasedEraMary ->
         TxOut
           <$> o .: "address"
-          <*> o .: "value"
+          <*> parseTxOutValue shelleyBasedEra o
           <*> return TxOutDatumNone
           <*> return ReferenceScriptNone
       ShelleyBasedEraAllegra ->
         TxOut
           <$> o .: "address"
-          <*> o .: "value"
+          <*> parseTxOutValue shelleyBasedEra o
           <*> return TxOutDatumNone
           <*> return ReferenceScriptNone
       ShelleyBasedEraAlonzo -> alonzoTxOutParser AlonzoEraOnwardsAlonzo o
@@ -701,13 +719,13 @@ instance IsShelleyBasedEra era => FromJSON (TxOut CtxUTxO era) where
         Nothing ->
           TxOut
             <$> o .: "address"
-            <*> o .: "value"
+            <*> parseTxOutValue (convert w) o
             <*> return TxOutDatumNone
             <*> return ReferenceScriptNone
         Just dHash ->
           TxOut
             <$> o .: "address"
-            <*> o .: "value"
+            <*> parseTxOutValue (convert w) o
             <*> return (TxOutDatumHash w dHash)
             <*> return ReferenceScriptNone
 
@@ -931,30 +949,41 @@ instance IsCardanoEra era => ToJSON (TxOutValue era) where
       toJSON ll
     TxOutValueShelleyBased sbe val ->
       shelleyBasedEraConstraints sbe $ toJSON (fromLedgerValue sbe val)
-    TxOutValueStoreBacked{} ->
-      error "toJSON TxOutValue: store-backed output JSON is not supported"
+    TxOutValueStoreBacked (L.ApplicationAssets assets) ->
+      object ["applicationAssets" .= fromLedgerValue ShelleyBasedEraDijkstra assets]
 
 instance IsShelleyBasedEra era => FromJSON (TxOutValue era) where
   parseJSON = withObject "TxOutValue" $ \o ->
-    forEraInEon @MaryEraOnwards
-      (convert (shelleyBasedEra @era))
-      ( shelleyBasedEraConstraints (shelleyBasedEra @era) $ do
-          ll <- o .: "lovelace"
-          let sbe = shelleyBasedEra @era
-          pure $
-            TxOutValueShelleyBased sbe $
-              A.mkAdaValue sbe ll
-      )
-      ( \w -> do
-          let l = toList o
-              sbe = shelleyBasedEra @era
-          vals <- mapM decodeAssetId l
-          pure $
-            shelleyBasedEraConstraints sbe $
-              TxOutValueShelleyBased sbe $
-                toLedgerValue w $
-                  mconcat vals
-      )
+    case KeyMap.lookup "applicationAssets" o of
+      Just assets -> case shelleyBasedEra @era of
+        ShelleyBasedEraDijkstra
+          | KeyMap.size o == 1 -> do
+              parsed <- Aeson.parseJSON assets :: Aeson.Parser (TxOutValue DijkstraEra)
+              case parsed of
+                TxOutValueShelleyBased _ value ->
+                  pure $ TxOutValueStoreBacked (L.ApplicationAssets value)
+                TxOutValueStoreBacked{} -> fail "TxOutValue: nested applicationAssets"
+        _ -> fail "TxOutValue: applicationAssets requires Dijkstra and no other value fields"
+      Nothing ->
+        forEraInEon @MaryEraOnwards
+          (convert (shelleyBasedEra @era))
+          ( shelleyBasedEraConstraints (shelleyBasedEra @era) $ do
+              ll <- o .: "lovelace"
+              let sbe = shelleyBasedEra @era
+              pure $
+                TxOutValueShelleyBased sbe $
+                  A.mkAdaValue sbe ll
+          )
+          ( \w -> do
+              let l = toList o
+                  sbe = shelleyBasedEra @era
+              vals <- mapM decodeAssetId l
+              pure $
+                shelleyBasedEraConstraints sbe $
+                  TxOutValueShelleyBased sbe $
+                    toLedgerValue w $
+                      mconcat vals
+          )
    where
     decodeAssetId :: (Aeson.Key, Aeson.Value) -> Aeson.Parser Value
     decodeAssetId (polid, Aeson.Object assetNameHm) = do
