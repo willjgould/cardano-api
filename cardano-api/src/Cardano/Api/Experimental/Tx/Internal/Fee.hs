@@ -247,9 +247,6 @@ checkSupportedAutoBalanceFields
   -> TxBodyContent (LedgerEra era)
   -> Either (TxBodyErrorAutoBalance (LedgerEra era)) ()
 checkSupportedAutoBalanceFields utxo content = obtainCommonConstraints (useEra @era) $ do
-  forM_ (txOuts content) $ \(TxOut output) -> case output of
-    L.StoreBackedTxOut{} -> Left TxBodyErrorStoreBackedOutputNotSupported
-    L.ImplicitDepositTxOut{} -> Right ()
   let children = txSubTransactions content
   when (not (null children) && hasPlutusScriptWitnesses content) $
     Left TxBodyErrorNestedScriptsNotSupported
@@ -586,11 +583,15 @@ checkMinUTxOValue
   -> TxOut (LedgerEra era)
   -> Either (TxOut (LedgerEra era), Coin) ()
   -- ^ @Left (offending txout, minimum required utxo)@ or @Right ()@ when txout is ok
-checkMinUTxOValue bpp txout@(TxOut out) = do
-  let minUTxO = calculateMinimumUTxO bpp txout
-  if out ^. L.coinTxOutL >= minUTxO
-    then Right ()
-    else Left (txout, minUTxO)
+checkMinUTxOValue bpp txout@(TxOut out) = case out of
+  -- Store-backed outputs pay through the separate deposit declaration, whose
+  -- amount is checked by the ledger. They have no implicit ADA minimum.
+  L.StoreBackedTxOut{} -> Right ()
+  L.ImplicitDepositTxOut{} -> do
+    let minUTxO = calculateMinimumUTxO bpp txout
+    if out ^. L.coinTxOutL >= minUTxO
+      then Right ()
+      else Left (txout, minUTxO)
 
 calculateMinimumUTxO
   :: HasCallStack
@@ -1585,8 +1586,10 @@ evaluateTransactionExecutionUnits systemstart epochInfo pp utxo tx =
 -- Signed key-only children are preserved. Supply their inputs in the UTxO and
 -- declare the net UTxO deposit explicitly; the ledger includes both in the
 -- balance, and the signed child bytes contribute to the fee. The parent change
--- uses an implicit deposit. Automatic deposit pricing and nested script
--- execution are not supported here.
+-- uses an implicit deposit. Direct store-backed outputs are also supported
+-- with an explicit net deposit; minimum ADA applies only to implicit-deposit
+-- outputs. Automatic deposit pricing and nested script execution are not
+-- supported here.
 makeTransactionBodyAutoBalance
   :: forall era
    . ()
