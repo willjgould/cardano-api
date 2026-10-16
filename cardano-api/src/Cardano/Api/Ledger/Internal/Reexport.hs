@@ -20,6 +20,7 @@ module Cardano.Api.Ledger.Internal.Reexport
   , fromVRFVerKeyHash
   , toVRFVerKeyHash
   , StakePoolParams (..)
+  , BlsKey (..)
   , HasKeyRole
   , MIRPot (..)
   , MIRTarget (..)
@@ -52,7 +53,7 @@ module Cardano.Api.Ledger.Internal.Reexport
   , toCompactPartial
   , EraPParams (..)
   , Era (..)
-  , EraTxOut
+  , EraTxOut (addrTxOutL)
   , EraImplicitDepositTxOut
   , type ImplicitDepositTxOut
   , Inject (..)
@@ -172,6 +173,10 @@ module Cardano.Api.Ledger.Internal.Reexport
   , AsIx (..)
   , CoinPerWord (..)
   , Data (..)
+  , Datum (..)
+  , AlonzoEraTxOut (datumTxOutF)
+  , hashBinaryData
+  , hashScript
   , EraTxWits (..)
   , ExUnits (..)
   , Redeemers (..)
@@ -184,7 +189,8 @@ module Cardano.Api.Ledger.Internal.Reexport
   , pattern AlonzoGenesis
   , AsIxItem (..)
   , EraGov
-  , EraTx (witsTxL, bodyTxL)
+  , EraTx (witsTxL, bodyTxL, auxDataTxL)
+  , EraTxAuxData (metadataTxAuxDataL)
   , EraTxBody (..)
   , TopTx
   , Tx
@@ -244,12 +250,13 @@ import Cardano.Ledger.Allegra.Scripts (AllegraEraScript (..), Timelock (..), sho
 import Cardano.Ledger.Alonzo.Core
   ( AlonzoEraScript (..)
   , AlonzoEraTxBody (..)
+  , AlonzoEraTxOut (datumTxOutF)
   , AlonzoEraTxWits (..)
   , AsIx (..)
   , AsIxItem (AsIxItem)
   , CoinPerWord (..)
   , EraGov
-  , EraTx (bodyTxL, witsTxL)
+  , EraTx (auxDataTxL, bodyTxL, witsTxL)
   , EraTxWits (..)
   , PParamsUpdate (..)
   , Tx
@@ -385,14 +392,16 @@ import Cardano.Ledger.Core
   ( Era (..)
   , EraImplicitDepositTxOut
   , EraPParams (..)
+  , EraTxAuxData (metadataTxAuxDataL)
   , EraTxBody (..)
-  , EraTxOut
+  , EraTxOut (addrTxOutL)
   , PParams (..)
   , PoolCert (..)
   , TopTx
   , TxOut (..)
   , Value
   , fromEraCBOR
+  , hashScript
   , mkBasicTxOutWithImplicitDeposit
   , ppMinFeeAL
   , ppMinUTxOValueL
@@ -421,7 +430,7 @@ import Cardano.Ledger.Keys
   , toVRFVerKeyHash
   )
 import Cardano.Ledger.Mary.Value (MaryValue (..), MultiAsset (..), PolicyID (..), valueFromList)
-import Cardano.Ledger.Plutus.Data (Data (..), unData)
+import Cardano.Ledger.Plutus.Data (Data (..), Datum (..), hashBinaryData, unData)
 import Cardano.Ledger.Plutus.Language
   ( Language
   , Plutus
@@ -454,7 +463,8 @@ import Cardano.Ledger.Shelley.TxCert
   , ShelleyTxCert (..)
   )
 import Cardano.Ledger.State
-  ( PoolMetadata (..)
+  ( BlsKey (..)
+  , PoolMetadata (..)
   , ScriptsNeeded
   , StakePoolParams (..)
   , StakePoolRelay (..)

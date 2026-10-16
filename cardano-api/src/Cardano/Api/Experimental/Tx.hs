@@ -129,45 +129,119 @@ module Cardano.Api.Experimental.Tx
   , getUnsignedTxFee
 
     -- * TxBodyContent
-  , TxBodyContent (..)
+
+    -- | Body content is one type, 'BodyContent', indexed by the transaction
+    -- level. 'TxBodyContent' is a top-level body and 'SubTxBodyContent' is a
+    -- Dijkstra sub-transaction body. A setter typed @BodyContent l era@ works
+    -- on both; a setter typed @TxBodyContent era@ sets a field that only a
+    -- top-level body has.
+  , BodyContent (..)
+  , TxBodyContent
+  , SubTxBodyContent
   , defaultTxBodyContent
+  , defaultSubTxBodyContent
   , mkTxCertificates
   , mkTxVotingProcedures
   , mkTxProposalProcedures
+
+    -- ** Fields of a top-level body
+  , txIns
+  , txInsCollateral
+  , txInsReference
+  , txOuts
+  , txTotalCollateral
+  , txReturnCollateral
+  , txFee
+  , txValidityLowerBound
+  , txValidityUpperBound
+  , txMetadata
+  , txAuxScripts
+  , txExtraKeyWits
+  , txProtocolParams
+  , txWithdrawals
+  , txCertificates
+  , txMintValue
+  , txScriptValidity
+  , txProposalProcedures
+  , txVotingProcedures
+  , txCurrentTreasuryValue
+  , txTreasuryDonation
+  , txSupplementalDatums
+  , txGuards
+  , txSubTransactions
+  , txNetUTxODepositChange
+  , txRequiredTopLevelGuards
+  , txDirectDeposits
+  , txAccountBalanceIntervals
+  , txStartingAccountBalanceIntervals
+
+    -- ** Fields of a sub-transaction body
+  , subTxIns
+  , subTxInsReference
+  , subTxOuts
+  , subTxNetUTxODepositChange
+  , subTxValidityLowerBound
+  , subTxValidityUpperBound
+  , subTxMetadata
+  , subTxAuxScripts
+  , subTxProtocolParams
+  , subTxWithdrawals
+  , subTxCertificates
+  , subTxMintValue
+  , subTxProposalProcedures
+  , subTxVotingProcedures
+  , subTxCurrentTreasuryValue
+  , subTxTreasuryDonation
+  , subTxSupplementalDatums
+  , subTxGuards
+  , subTxRequiredTopLevelGuards
+  , subTxDirectDeposits
+  , subTxAccountBalanceIntervals
+
+    -- ** Setters shared by both levels
   , modTxOuts
   , setTxAuxScripts
   , setTxCertificates
-  , setTxReturnCollateral
-  , setTxTotalCollateral
   , setTxCurrentTreasuryValue
-  , setTxExtraKeyWits
-  , setTxFee
   , setTxIns
-  , setTxInsCollateral
   , setTxInsReference
   , setTxMetadata
   , setTxMintValue
   , setTxOuts
   , setTxProposalProcedures
   , setTxProtocolParams
-  , setTxScriptValidity
-  , setTxSubTransactions
   , setTxSupplementalDatums
   , setTxTreasuryDonation
   , setTxValidityLowerBound
   , setTxValidityUpperBound
   , setTxVotingProcedures
   , setTxWithdrawals
+  , setTxGuards
+  , setTxRequiredTopLevelGuards
+  , setTxDirectDeposits
+  , setTxAccountBalanceIntervals
+
+    -- ** Setters for top-level bodies only
+  , setTxReturnCollateral
+  , setTxTotalCollateral
+  , setTxExtraKeyWits
+  , setTxFee
+  , setTxInsCollateral
+  , setTxScriptValidity
+  , setTxSubTransactions
+  , setTxSignedSubTransactions
+  , setTxStartingAccountBalanceIntervals
 
     -- * Sub-transactions (Dijkstra era onwards)
-  , SubTxBodyContent (..)
-  , defaultSubTxBodyContent
   , UnsignedSubTx (..)
-  , makeUnsignedSubTx
   , SignedSubTx (..)
+  , makeUnsignedSubTx
   , makeSubTxKeyWitness
   , signSubTx
-  , setTxSignedSubTransactions
+  , makeSignedSubTx
+  , getUnsignedSubTxId
+  , getSignedSubTxId
+  , AsType (AsUnsignedSubTx, AsSignedSubTx)
 
     -- * TxBodyContent sub type
   , TxCertificates (..)
@@ -234,15 +308,15 @@ import Cardano.Api.Era.Internal.Core qualified as Api
 import Cardano.Api.Era.Internal.Eon.ShelleyBasedEra
 import Cardano.Api.Experimental.Era
 import Cardano.Api.Experimental.Tx.Internal.AnyWitness
-import Cardano.Api.Experimental.Tx.Internal.BodyContent.New
+import Cardano.Api.Experimental.Tx.Internal.BodyContent
 import Cardano.Api.Experimental.Tx.Internal.Fee
+import Cardano.Api.Experimental.Tx.Internal.SubTransaction
 import Cardano.Api.Experimental.Tx.Internal.TxScriptWitnessRequirements
 import Cardano.Api.Experimental.Tx.Internal.Type
 import Cardano.Api.HasTypeProxy (HasTypeProxy (..), Proxy, asType)
 import Cardano.Api.Ledger.Internal.Reexport qualified as L
 import Cardano.Api.Plutus.Internal.Script qualified as Api
 import Cardano.Api.Pretty (docToString, pretty)
-import Cardano.Api.ProtocolParameters
 import Cardano.Api.Query.Internal.Type.QueryInMode (LedgerEpochInfo, SystemStart)
 import Cardano.Api.Serialise.Raw
   ( SerialiseAsRawBytes (..)
@@ -251,7 +325,6 @@ import Cardano.Api.Serialise.Raw
 import Cardano.Api.Tx.Internal.Body qualified as Api
 import Cardano.Api.Tx.Internal.Sign
 
-import Cardano.Crypto.Hash qualified as Hash
 import Cardano.Ledger.Alonzo.Core qualified as Ledger
 import Cardano.Ledger.Api qualified as L
 import Cardano.Ledger.Binary qualified as Ledger
@@ -264,7 +337,6 @@ import Data.ByteString.Lazy (fromStrict)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
-import Data.Set qualified as Set
 import GHC.Stack
 import Lens.Micro
 
@@ -272,11 +344,6 @@ getUnsignedTxFee :: UnsignedTx era -> L.Coin
 getUnsignedTxFee (UnsignedTx unsignedTx) =
   let txbody = unsignedTx ^. L.bodyTxL
    in txbody ^. L.feeTxBodyL
-
-hashTxBody
-  :: L.HashAnnotated (Ledger.TxBody Ledger.TopTx era) L.EraIndependentTxBody
-  => L.TxBody Ledger.TopTx era -> Hash.Hash L.HASH L.EraIndependentTxBody
-hashTxBody = L.extractHash . L.hashAnnotated
 
 makeKeyWitness
   :: HasCallStack
@@ -286,13 +353,7 @@ makeKeyWitness
   -> L.WitVKey L.Witness
 makeKeyWitness era (UnsignedTx unsignedTx) wsk =
   obtainCommonConstraints era $
-    let txbody = unsignedTx ^. L.bodyTxL
-        txhash :: Hash.Hash L.HASH L.EraIndependentTxBody
-        txhash = obtainCommonConstraints era $ hashTxBody txbody
-        sk = toShelleySigningKey wsk
-        vk = getShelleyKeyWitnessVerificationKey sk
-        signature = makeShelleySignature txhash sk
-     in L.WitVKey vk signature
+    makeShelleyKeyWitnessFromHash (hashTxBody (unsignedTx ^. L.bodyTxL)) wsk
 
 -- | A transaction that has been witnesssed
 data SignedTx era
@@ -335,54 +396,8 @@ signTx
   -> SignedTx era
 signTx era bootstrapWits shelleyKeyWits (UnsignedTx unsigned) =
   obtainCommonConstraints era $
-    let currentScriptWitnesses = unsigned ^. L.witsTxL
-        keyWits =
-          obtainCommonConstraints era $
-            L.mkBasicTxWits
-              & L.addrTxWitsL
-                .~ Set.fromList shelleyKeyWits
-              & L.bootAddrTxWitsL
-                .~ Set.fromList bootstrapWits
-        signedTx = unsigned & L.witsTxL .~ (keyWits <> currentScriptWitnesses)
-     in SignedTx signedTx
-
--- | A Dijkstra sub-transaction with key witnesses attached.
-newtype SignedSubTx = SignedSubTx (Ledger.Tx Ledger.SubTx (LedgerEra Api.DijkstraEra))
-  deriving (Eq, Show)
-
--- | Sign the child's own body. A parent signature does not witness its children.
-makeSubTxKeyWitness
-  :: HasCallStack
-  => UnsignedSubTx
-  -> ShelleyWitnessSigningKey
-  -> L.WitVKey L.Witness
-makeSubTxKeyWitness (UnsignedSubTx unsigned) wsk =
-  let txhash = L.extractHash $ L.hashAnnotated (unsigned ^. L.bodyTxL)
-      sk = toShelleySigningKey wsk
-      vk = getShelleyKeyWitnessVerificationKey sk
-   in L.WitVKey vk (makeShelleySignature txhash sk)
-
--- | Attach key witnesses, preserving any witnesses already present.
-signSubTx
-  :: [L.BootstrapWitness]
-  -> [L.WitVKey L.Witness]
-  -> UnsignedSubTx
-  -> SignedSubTx
-signSubTx bootstrapWits shelleyKeyWits (UnsignedSubTx unsigned) =
-  let keyWits =
-        L.mkBasicTxWits
-          & L.addrTxWitsL .~ Set.fromList shelleyKeyWits
-          & L.bootAddrTxWitsL .~ Set.fromList bootstrapWits
-   in SignedSubTx $ unsigned & L.witsTxL %~ (keyWits <>)
-
--- | Replace the children with their signed forms, using 'setTxSubTransactions'.
--- Do this before signing the parent: its body includes the child witnesses.
-setTxSignedSubTransactions
-  :: [SignedSubTx]
-  -> TxBodyContent (LedgerEra Api.DijkstraEra)
-  -> TxBodyContent (LedgerEra Api.DijkstraEra)
-setTxSignedSubTransactions children =
-  setTxSubTransactions [child | SignedSubTx child <- children]
+    SignedTx $
+      addKeyWitnesses bootstrapWits shelleyKeyWits unsigned
 
 -- | Like 'evaluateTransaction' but accepts a 'SignedTx' directly.
 evaluateSignedTx
