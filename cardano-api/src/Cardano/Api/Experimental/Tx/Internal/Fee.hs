@@ -26,7 +26,9 @@ module Cardano.Api.Experimental.Tx.Internal.Fee
   , evaluateTransactionExecutionUnits
   , evaluateTransactionFee
   , indexWitnessedTxProposalProcedures
+  , ChangeOutputKind (..)
   , makeTransactionBodyAutoBalance
+  , makeTransactionBodyAutoBalanceWithChangeOutput
   , substituteExecutionUnits
   -- Internal
   , toUnsigned
@@ -107,6 +109,12 @@ import GHC.Stack
 import Lens.Micro ((%~), (.~), (^.))
 import Prettyprinter (punctuate)
 
+-- | The deposit representation of automatically generated change.
+data ChangeOutputKind
+  = ImplicitDepositChange
+  | StoreBackedChange
+  deriving (Eq, Show)
+
 data TxBodyErrorAutoBalance era
   = -- | There is not enough ada and non-ada to cover both the outputs and the fees.
     -- The transaction should be changed to provide more input assets, or
@@ -159,6 +167,8 @@ data TxBodyErrorAutoBalance era
   | TxBodyErrorNestedScriptsNotSupported
   | TxBodyErrorAutomaticDepositNotSupported
   | TxBodyErrorAutomaticDepositMissingInput TxIn
+  | TxBodyErrorStoreBackedChangeRequiresDijkstra
+  | TxBodyErrorStoreBackedChangeRequiresDepositDeclaration
 
 deriving instance Show (TxBodyErrorAutoBalance era)
 
@@ -237,6 +247,10 @@ instance Error (TxBodyErrorAutoBalance era) where
     TxBodyErrorAutomaticDepositMissingInput input ->
       "Automatic deposit calculation needs the selected spending input in the supplied UTxO: "
         <> pshow input
+    TxBodyErrorStoreBackedChangeRequiresDijkstra ->
+      "Store-backed change requires the Dijkstra era."
+    TxBodyErrorStoreBackedChangeRequiresDepositDeclaration ->
+      "Store-backed change requires an explicit net UTxO deposit declaration that includes the final change output's backing."
 
 -- | Estimation without the real UTxO cannot account for child inputs.
 checkSupportedBalanceFields :: TxBodyContent era -> Either (TxBodyErrorAutoBalance era) ()
@@ -591,7 +605,14 @@ checkNonNegative
   -> Either (TxBodyErrorAutoBalance (LedgerEra era)) IsEmpty
   -- ^ result of check if txout is empty
 checkNonNegative bpparams txout@(TxOut balance) = case balance of
-  L.StoreBackedTxOut{} -> Left TxBodyErrorStoreBackedOutputNotSupported
+  L.StoreBackedTxOut output ->
+    obtainCommonConstraints (useEra @era) $ do
+      let L.ApplicationAssets value@(L.MaryValue coin assets) = output ^. L.applicationAssetsTxOutL
+      unless (L.pointwise (>=) value mempty) $
+        Left (TxBodyErrorBalanceNegative coin assets)
+      -- Even empty application assets retain the requested output, its backing
+      -- and any settlement-output index. Only empty implicit change is omitted.
+      pure NonEmpty
   L.ImplicitDepositTxOut output -> do
     let outValue@(L.MaryValue coin multiAsset) = output ^. obtainCommonConstraints (useEra @era) L.valueTxOutL
         isPositiveValue = L.pointwise (>) outValue mempty
@@ -608,8 +629,9 @@ checkNonNegative bpparams txout@(TxOut balance) = case balance of
       | otherwise -> pure NonEmpty
 
 -- | In the event of spending the exact amount of lovelace and non-ada assets in
--- the specified input(s), this function excludes the change
--- output. Note that this does not save any fees because by default
+-- the specified input(s), this function excludes implicit change. Explicitly
+-- requested store-backed change is retained even with empty application assets.
+-- Note that omitting implicit change does not save any fees because by default
 -- the fee calculation includes a change address for simplicity and
 -- we make no attempt to recalculate the tx fee without a change address.
 checkAndIncludeChange
@@ -1673,7 +1695,38 @@ makeTransactionBodyAutoBalance
   -> Either
        (TxBodyErrorAutoBalance (LedgerEra era))
        (UnsignedTx (LedgerEra era), TxBodyContent (LedgerEra era))
-makeTransactionBodyAutoBalance
+makeTransactionBodyAutoBalance =
+  makeTransactionBodyAutoBalanceWithChangeOutput ImplicitDepositChange
+
+-- | Balance with an explicit choice of change-output representation.
+-- Store-backed change requires Dijkstra and an explicit net UTxO deposit
+-- declaration that includes the backing of the final change output. This
+-- function preserves that declaration; it does not infer recorded refunds or
+-- calculate the change output's backing. The caller must price the final
+-- serialized change, including any change in its encoded coin width.
+-- Store-backed change has no implicit minimum ADA and is retained even when
+-- its application assets are empty.
+makeTransactionBodyAutoBalanceWithChangeOutput
+  :: forall era
+   . ()
+  => HasCallStack
+  => IsEra era
+  => ChangeOutputKind
+  -> SystemStart
+  -> LedgerEpochInfo
+  -> L.PParams (LedgerEra era)
+  -> Set PoolId
+  -> Map StakeCredential L.Coin
+  -> Map (Ledger.Credential Ledger.DRepRole) L.Coin
+  -> L.UTxO (LedgerEra era)
+  -> TxBodyContent (LedgerEra era)
+  -> AddressInEra era
+  -> Maybe Word
+  -> Either
+       (TxBodyErrorAutoBalance (LedgerEra era))
+       (UnsignedTx (LedgerEra era), TxBodyContent (LedgerEra era))
+makeTransactionBodyAutoBalanceWithChangeOutput
+  changeOutputKind
   systemstart
   history
   pp
@@ -1684,6 +1737,18 @@ makeTransactionBodyAutoBalance
   requestedContent
   changeaddr
   mnkeys = do
+    (makeChangeOutput :: L.Value (LedgerEra era) -> TxOut (LedgerEra era)) <- case changeOutputKind of
+      ImplicitDepositChange ->
+        pure $ \value ->
+          obtainCommonConstraints (useEra @era) $
+            TxOut (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) value)
+      StoreBackedChange -> case useEra @era of
+        ConwayEra -> Left TxBodyErrorStoreBackedChangeRequiresDijkstra
+        DijkstraEra -> do
+          unless (TopTx.hasUTxODepositDeclaration (txNetUTxODepositChange requestedContent)) $
+            Left TxBodyErrorStoreBackedChangeRequiresDepositDeclaration
+          pure $ \value ->
+            TxOut (L.mkBasicTxOutWithStoreBackedDeposit (toShelleyAddr changeaddr) (L.ApplicationAssets value))
     checkSupportedAutoBalanceFields utxo requestedContent
     -- The ledger requires collateral only for transactions that run Plutus
     -- scripts, so collateral inputs on a transaction without them are an
@@ -1717,8 +1782,7 @@ makeTransactionBodyAutoBalance
           (throwError $ TxBodyErrorBalanceNegative initialCoin initialMultiAsset)
 
     let initialChangeTxOut :: TxOut (LedgerEra era) =
-          obtainCommonConstraints (useEra @era) $
-            TxOut (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) initialChangeTxOutValue)
+          makeChangeOutput initialChangeTxOutValue
 
     -- Initial change is only used for execution units evaluation, so we don't require minimum UTXO requirement
     -- to be satisfied at this point
@@ -1838,13 +1902,12 @@ makeTransactionBodyAutoBalance
         -- The multiasset output of evaluateTransactionBalance will be negative when
         -- minting a multiasset. Therefore we must make the multiasset balance positive
         balanceTxOut :: TxOut (LedgerEra era) =
-          obtainCommonConstraints (useEra @era) $
-            TxOut (L.mkBasicTxOutWithImplicitDeposit (toShelleyAddr changeaddr) balance)
+          makeChangeOutput balance
       first (uncurry TxBodyErrorMinUTxONotMet)
         . mapM_ (checkMinUTxOValue pp)
         $ txOuts txbodycontent1
 
-      -- check if change meets txout criteria, and include if non-zero
+      -- Validate change, omitting it only when it is empty implicit change.
       finalTxOuts <- checkAndIncludeChange pp balanceTxOut (txOuts txbodycontent1)
 
       -- TODO: we could add the extra fee for the CBOR encoding of the change,
