@@ -74,12 +74,15 @@ import Cardano.Api.Value.Internal
 
 import Cardano.Ledger.Alonzo.Core qualified as Ledger
 import Cardano.Ledger.Api qualified as L
+import Cardano.Ledger.Binary (mkSized)
 import Cardano.Ledger.Coin qualified as L
 import Cardano.Ledger.Conway.Governance qualified as L
 import Cardano.Ledger.Credential as Ledger (Credential, credKeyHashWitness)
+import Cardano.Ledger.Dijkstra.Rules qualified as Dijkstra
 import Cardano.Ledger.Dijkstra.UTxODeposit.TopTx qualified as TopTx
 import Cardano.Ledger.Keys (asWitness)
 import Cardano.Ledger.State qualified as L (getScriptsHashesNeeded)
+import Cardano.Ledger.StrictlyPositiveCoin (mkStrictlyPositiveCoin)
 import Cardano.Ledger.Val qualified as L
 
 import Control.Monad
@@ -154,6 +157,8 @@ data TxBodyErrorAutoBalance era
   | TxBodyErrorStoreBackedOutputNotSupported
   | TxBodyErrorNestedOrDepositStoreNotSupported
   | TxBodyErrorNestedScriptsNotSupported
+  | TxBodyErrorAutomaticDepositNotSupported
+  | TxBodyErrorAutomaticDepositMissingInput TxIn
 
 deriving instance Show (TxBodyErrorAutoBalance era)
 
@@ -227,6 +232,11 @@ instance Error (TxBodyErrorAutoBalance era) where
       "Balancing sub-transactions or deposit-store operations is not supported."
     TxBodyErrorNestedScriptsNotSupported ->
       "Balancing nested transactions with scripts is not supported."
+    TxBodyErrorAutomaticDepositNotSupported ->
+      "Automatic deposit calculation for new store-backed outputs requires no sub-transactions or store-backed spending inputs. Supply the net UTxO deposit declaration explicitly."
+    TxBodyErrorAutomaticDepositMissingInput input ->
+      "Automatic deposit calculation needs the selected spending input in the supplied UTxO: "
+        <> pshow input
 
 -- | Estimation without the real UTxO cannot account for child inputs.
 checkSupportedBalanceFields :: TxBodyContent era -> Either (TxBodyErrorAutoBalance era) ()
@@ -259,6 +269,48 @@ checkSupportedAutoBalanceFields utxo content = obtainCommonConstraints (useEra @
           || not (Map.null (L.unRedeemers (witnesses ^. L.rdmrsTxWitsL)))
       )
       $ Left TxBodyErrorNestedScriptsNotSupported
+
+-- | Infer only new top-level allocations. Historical refunds need the recorded
+-- deposit store, which this API does not receive. An explicit declaration is
+-- always preserved; transactions without new store-backed outputs follow the
+-- existing path. Change uses an implicit deposit, so it adds no store charge.
+calculateMissingUTxODeposit
+  :: forall era
+   . IsEra era
+  => L.PParams (LedgerEra era)
+  -> L.UTxO (LedgerEra era)
+  -> TxBodyContent (LedgerEra era)
+  -> Either (TxBodyErrorAutoBalance (LedgerEra era)) (TxBodyContent (LedgerEra era))
+calculateMissingUTxODeposit pp utxo content
+  | TopTx.hasUTxODepositDeclaration (txNetUTxODepositChange content) = Right content
+  | otherwise = case useEra @era of
+      ConwayEra -> Right content
+      DijkstraEra
+        | not (any isStoreBacked (txOuts content)) -> Right content
+        | otherwise -> do
+            unless (null (txSubTransactions content)) $
+              Left TxBodyErrorAutomaticDepositNotSupported
+            -- Only selected spending inputs can release a recorded deposit.
+            -- Reference, collateral and unselected entries are irrelevant here.
+            forM_ (txIns content) $ \(input, _) ->
+              case Map.lookup (toShelleyTxIn input) (L.unUTxO utxo) of
+                Nothing -> Left $ TxBodyErrorAutomaticDepositMissingInput input
+                Just L.StoreBackedTxOut{} -> Left TxBodyErrorAutomaticDepositNotSupported
+                Just L.ImplicitDepositTxOut{} -> Right ()
+            let deposit = foldMap price (txOuts content)
+                price (TxOut output) =
+                  Dijkstra.requiredUTxODeposit pp $
+                    mkSized (L.eraProtVerLow @(LedgerEra era)) output
+                declaration =
+                  maybe
+                    TopTx.DeclaresZeroNetUTxODeposit
+                    TopTx.DeclaresNetUTxODepositAllocation
+                    (mkStrictlyPositiveCoin deposit)
+            -- Presence is required even when the protocol byte price is zero.
+            Right content{txNetUTxODepositChange = declaration}
+ where
+  isStoreBacked (TxOut L.StoreBackedTxOut{}) = True
+  isStoreBacked _ = False
 
 -- | Use when you do not have access to the UTxOs you intend to spend
 estimateBalancedTxBody
@@ -1586,10 +1638,14 @@ evaluateTransactionExecutionUnits systemstart epochInfo pp utxo tx =
 -- Signed key-only children are preserved. Supply their inputs in the UTxO and
 -- declare the net UTxO deposit explicitly; the ledger includes both in the
 -- balance, and the signed child bytes contribute to the fee. The parent change
--- uses an implicit deposit. Direct store-backed outputs are also supported
--- with an explicit net deposit; minimum ADA applies only to implicit-deposit
--- outputs. Automatic deposit pricing and nested script execution are not
--- supported here.
+-- uses an implicit deposit. For a Dijkstra transaction with direct store-backed
+-- outputs, no children and only implicit-deposit spending inputs, an absent
+-- deposit declaration is calculated from the outputs and protocol parameters
+-- before balancing fees and change. All selected spending inputs must be in
+-- the supplied UTxO. Explicit declarations are preserved. Automatic refunds,
+-- nested deposit pricing and nested script execution are not supported here.
+-- Refunds would require the recorded deposit store. Minimum ADA applies only
+-- to implicit-deposit outputs.
 makeTransactionBodyAutoBalance
   :: forall era
    . ()
@@ -1625,10 +1681,10 @@ makeTransactionBodyAutoBalance
   stakeDelegDeposits
   drepDelegDeposits
   utxo
-  txbodycontent
+  requestedContent
   changeaddr
   mnkeys = do
-    checkSupportedAutoBalanceFields utxo txbodycontent
+    checkSupportedAutoBalanceFields utxo requestedContent
     -- The ledger requires collateral only for transactions that run Plutus
     -- scripts, so collateral inputs on a transaction without them are an
     -- error: the ledger would ignore them, but they would cost fees and
@@ -1636,7 +1692,8 @@ makeTransactionBodyAutoBalance
     -- should become invalid when some UTxO is spent can use a reference
     -- input for that purpose.
     first TxBodyErrorCollateral $
-      checkCollateralOnlyWithPlutusScripts txbodycontent
+      checkCollateralOnlyWithPlutusScripts requestedContent
+    txbodycontent <- calculateMissingUTxODeposit @era pp utxo requestedContent
     -- Our strategy is to:
     -- 1. evaluate all the scripts to get the exec units, update with ex units
     -- 2. figure out the overall min fees
